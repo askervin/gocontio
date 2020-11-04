@@ -1,0 +1,70 @@
+#!/bin/bash
+
+# Debugging NRIPLUGIN in real action with go delve:
+# 0. Install go delve (go get github.com/go-delve/delve/cmd/dlv)
+# 1. Copy or symlink this script as /path/to/dlv-attach-NRIPLUGIN
+#    to the same directory where NRIPLUGIN to be debugged is located.
+# 2. Replace plugin type NRIPLUGIN with "dlv-attach-NRIPLUGIN"
+#    in /etc/nri/conf.json
+#
+# When containerd launches dlv-attach-NRIPLUGIN, this wrapper launches
+# real NRIPLUGIN, but will not pass standard input content to the
+# plugin until user has attached dlv to it.
+#
+# Example: debugging /opt/nri/bin/myplugin
+# $ ln -s dlv-attach-NRIPLUGIN /opt/nri/bin/dlv-attach-myplugin
+# $ sed -i 's/myplugin/dlv-attach-myplugin' /etc/nri/conf.json
+# $ kubectl create pod.yaml
+# $ dlv attach $(pidof myplugin)
+# (dlv) break Invoke
+# (dlv) continue
+
+NRI_PLUGIN_NAME="${0#*dlv-attach-}"
+NRI_PLUGIN_PATH="$(dirname "$(readlink -f "$0")")"
+
+NRI_PLUGIN_BIN="$NRI_PLUGIN_PATH/$NRI_PLUGIN_NAME"
+STDIN_PIPE=/tmp/dlv-attach-$NRI_PLUGIN_NAME.$$.stdin.pipe
+STDIN=/tmp/dlv-attach-$NRI_PLUGIN_NAME.$$.stdin
+DEBUG_LOG=/tmp/dlv-attach-$NRI_PLUGIN_NAME.$$.log
+
+log() {
+    echo "$EPOCHREALTIME $*" >> "$DEBUG_LOG"
+}
+echo -n "" > "$DEBUG_LOG"
+
+rm -f "$STDIN_PIPE"
+mkfifo "$STDIN_PIPE"
+trap "rm -f '$STDIN_PIPE' '$DEBUG_LOG'" EXIT TERM
+
+sleep infinity > "$STDIN_PIPE" &
+SLEEP_PID=$!
+
+log "launching '$NRI_PLUGIN_BIN $*'..."
+$NRI_PLUGIN_BIN "$@" < "$STDIN_PIPE" &
+NRI_PLUGIN_PID=$!
+
+log "waiting for 'dlv attach $NRI_PLUGIN_PID'..."
+DLV_PID=""
+while [ -z "$DLV_PID" ]; do
+    sleep 1
+    for dlv_pid in $(pidof dlv); do
+        if readlink -f /proc/$dlv_pid/fd/* | grep -q "$NRI_PLUGIN_BIN"; then
+            DLV_PID=$dlv_pid
+            log "attached dlv pid: $DLV_PID"
+            break
+        fi
+    done
+done
+
+log "saving wrapper stdin to $STDIN"
+cat > "$STDIN"
+log "passing wrapper stdin to $NRI_PLUGIN_PID..."
+cat < "$STDIN" > "$STDIN_PIPE"
+
+log "waiting for $NRI_PLUGIN_PID to finish..."
+wait $NRI_PLUGIN_PID
+NRI_EXIT_STATUS=$?
+
+log "NRI plugin exit status $NRI_EXIT_STATUS"
+kill $SLEEP_PID
+exit $NRI_EXIT_STATUS

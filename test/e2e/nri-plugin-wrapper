@@ -1,0 +1,205 @@
+#!/bin/bash
+
+# The behavior of this script depends on its name:
+# record-NRIPLUGIN:
+#     save stdin and stdout of NRIPLUGIN.
+# dlv-attach-NRIPLUGIN:
+#     start NRIPLUGIN but do not pass standard input to it
+#     before user has attached dlv to the NRIPLUGIN process.
+# nri-plugin-wrapper:
+#     list running NRIPLUGINs waiting for action
+#
+# Example 1: Record /opt/nri/bin/myplugin stdin and stdout:
+#     $ ln -s /opt/nri/bin/nri-plugin-wrapper /opt/nri/bin/record-myplugin
+#     $ sed -i 's/myplugin/record-myplugin/' /etc/nri/conf.json
+#     $ systemctl restart containerd
+#     $ watch ls -l /tmp/nri/plugin-wrapper/
+#
+# Example 2: Debug /opt/nri/bin/myplugin with dlv:
+#     $ ln -s /opt/nri/bin/nri-plugin-wrapper /opt/nri/bin/dlv-attach-myplugin
+#     $ sed -i 's/myplugin/dlv-attach-myplugin/' /etc/nri/conf.json
+#     $ systemctl restart containerd
+#     $ kubectl create pod.yaml
+#     $ dlv attach $(pidof myplugin)
+#     (dlv) break Invoke
+#     (dlv) continue
+#
+# Example 3: List plugins that wait for being debugged with dlv:
+# $ /opt/nri/bin/nri-plugin-wrapper
+#
+# Configure the wrapper in /etc/nri/plugin-wrapper/config:
+# temp_dir=/path/to/dir # the default is /tmp/nri/plugin-wrapper
+# keep_files=1          # do not delete tmp files after dlv debugging.
+# wait_queue_len=1      # capture only 1 dlv attach per plugin,
+#                       # let the rest continue. The default is "inf".
+# plugin_reaper=0       # do not install plugin reaper that kills
+#                       # the plugin process when wrapper is killed.
+
+WRAPPER_NAME="${0##*/}"
+WRAPPER_CONFIG=/etc/nri/plugin-wrapper/config
+source "$WRAPPER_CONFIG" >&/dev/null
+TMPDIR="${temp_dir:-/tmp/nri/plugin-wrapper}"
+WAIT_QUEUE_LEN="${wait_queue_len:-inf}"
+KEEP_FILES="${keep_files:-0}"
+PLUGIN_REAPER="${plugin_reaper:-1}"
+NRI_PLUGIN_PATH="$(dirname "$(readlink -f "$0")")"
+
+case "$WRAPPER_NAME" in
+    record-*)
+        NRI_PLUGIN_NAME="${WRAPPER_NAME#record-}"
+        NRI_PLUGIN_BIN="$NRI_PLUGIN_PATH/$NRI_PLUGIN_NAME"
+        ACTION=record
+        ;;
+    dlv-attach-*)
+        NRI_PLUGIN_NAME="${WRAPPER_NAME#dlv-attach-}"
+        NRI_PLUGIN_BIN="$NRI_PLUGIN_PATH/$NRI_PLUGIN_NAME"
+        ACTION=dlv-attach
+        ;;
+    nri-plugin-wrapper*)
+        NRI_PLUGIN_NAME=""
+        NRI_PLUGIN_BIN=""
+        ACTION=list-waiting-stdin
+        ;;
+    *)
+        echo "nri-plugin-wrapper called with bad name '$WRAPPER_NAME'" >&2
+        exit 1
+        ;;
+esac
+
+SESSION_ID="$$"
+
+STDIN_PIPE="$TMPDIR/$NRI_PLUGIN_NAME.$SESSION_ID.stdin.pipe"
+STDIN="$TMPDIR/$NRI_PLUGIN_NAME.$SESSION_ID.stdin"
+STDOUT="$TMPDIR/$NRI_PLUGIN_NAME.$SESSION_ID.stdout"
+STDERR="$TMPDIR/$NRI_PLUGIN_NAME.$SESSION_ID.stderr"
+WRAPPER_INPUT="$TMPDIR/$NRI_PLUGIN_NAME.$SESSION_ID.wrapper_input"
+WRAPPER_OUTPUT="$TMPDIR/$NRI_PLUGIN_NAME.$SESSION_ID.wrapper_output"
+
+log() {
+    echo "$EPOCHREALTIME $*" >> "$WRAPPER_OUTPUT"
+}
+
+mkdir -p "$TMPDIR"
+
+### ACTION: list-waiting-stdin
+# List plugins that are waiting for standard input
+# and what gets them going
+
+if [ "$ACTION" = "list-waiting-stdin" ]; then
+    for stdin_pipe in "$TMPDIR"/*.stdin.pipe; do
+        wrapper_output="${stdin_pipe%.stdin.pipe}.wrapper_output"
+        if [ -f "$wrapper_output" ] && grep -q 'waiting for:' "$wrapper_output"; then
+            echo "$(awk -F\. '{print "plugin "$1" wrapper "$2}' <<< ${stdin_pipe##*/}) $(grep 'waiting for:' "$wrapper_output" | sed 's/.*\(waiting for:\)/\1/')"
+        fi
+    done
+    exit 0
+fi
+
+log "wrapper action '$ACTION' on '$NRI_PLUGIN_BIN $*'" > "$WRAPPER_OUTPUT"
+
+### ACTION: record
+# List plugins that are waiting for standard input
+# and what gets them going
+
+if [ "$ACTION" = "record" ]; then
+    log "recording wrapper stdin to $STDIN"
+    cat > "$STDIN"
+    log "launching '$NRI_PLUGIN_BIN $*'..."
+    $NRI_PLUGIN_BIN "$@" < "$STDIN" > "$STDOUT" 2> "$STDERR"
+    NRI_EXIT_STATUS=$?
+    log "passing through stderr $STDERR"
+    cat "$STDERR" >&2
+    log "passing through stdout $STDOUT"
+    cat "$STDOUT"
+    log "passing through exit status: $NRI_EXIT_STATUS"
+    exit "$NRI_EXIT_STATUS"
+fi
+
+### ACTION: dlv-attach
+# Launch wrapped plugin and wait for "dlv attach" before
+# passing stdin to the process.
+# Alternatively one can echo "continue" to WRAPPER_INPUT.
+
+if [ "$WAIT_QUEUE_LEN" != "inf" ] && [ "$WAIT_QUEUE_LEN" -le "$(ls "$TMPDIR/$NRI_PLUGIN_NAME."*.stdin.pipe | wc -l)" ]; then
+    log "wait_queue_len limit $WAIT_QUEUE_LEN reached for $ACTION"
+    log "executing $NRI_PLUGIN_BIN"
+    exec "$NRI_PLUGIN_BIN" "$@"
+fi
+
+touch "$WRAPPER_INPUT"
+
+mkfifo "$STDIN_PIPE"
+
+# Shell will not execute NRI_PLUGIN_BIN unless a process having opened
+# STDIN_PIPE for writing. Sleep will take care of that:
+sleep infinity > "$STDIN_PIPE" &
+SLEEP_PID=$!
+
+log "launching '$NRI_PLUGIN_BIN $*'..."
+$NRI_PLUGIN_BIN "$@" < "$STDIN_PIPE" > "$STDOUT" 2> "$STDERR" &
+NRI_PLUGIN_PID=$!
+
+PLUGIN_REAPER_COMMAND="rm -f '$STDIN_PIPE' '$WRAPPER_INPUT'; kill -TERM $NRI_PLUGIN_PID $SLEEP_PID"
+
+# Install reaper for the case that this plugin wrapper gets killed
+# before the real plugin.
+if [ "$PLUGIN_REAPER" != "0" ] && [ -n "$PLUGIN_REAPER" ]; then
+    bash -c "
+        while [ -d /proc/$$ ]; do sleep 1; done;
+        [ -d /proc/$NRI_PLUGIN_PID ] && {
+            echo \$EPOCHREALTIME' wrapper died but plugin lives, running reaper' >> $WRAPPER_OUTPUT;
+            $PLUGIN_REAPER_COMMAND;
+        }" < /dev/null >& /dev/null &
+    log "installed plugin reaper '$PLUGIN_REAPER_COMMAND'"
+else
+    log "not installing plugin reaper"
+fi
+
+trap "rm -f '$STDIN_PIPE' '$WRAPPER_INPUT'" EXIT
+
+log "saving wrapper stdin to $STDIN"
+cat > "$STDIN"
+
+# Start waiting for something to happen. React on:
+# - any dlv process getting attached to the real plugin process
+# - reading "continue" from WRAPPER_INPUT
+log "waiting for: 'dlv attach $NRI_PLUGIN_PID'"
+DLV_PID=""
+while [ -z "$DLV_PID" ]; do
+    sleep 1
+    for dlv_pid in $(pidof dlv); do
+        if tr '\0' ' ' < /proc/$dlv_pid/cmdline | grep -q "attach $NRI_PLUGIN_PID"; then
+            DLV_PID=$dlv_pid
+            log "attached dlv pid: $DLV_PID"
+            break
+        fi
+    done
+    if grep -q "continue" "$WRAPPER_INPUT"; then
+        log "continue from wrapper_input, no dlv"
+        break
+    fi
+done
+
+log "passing wrapper stdin to $NRI_PLUGIN_PID..."
+cat < "$STDIN" > "$STDIN_PIPE"
+kill "$SLEEP_PID"
+
+log "waiting for $NRI_PLUGIN_PID to finish..."
+wait "$NRI_PLUGIN_PID"
+NRI_EXIT_STATUS=$?
+
+log "NRI plugin exit status $NRI_EXIT_STATUS"
+log "passing through plugin stderr"
+cat "$STDERR" >&2
+log "passing through plugin stdout"
+cat "$STDOUT"
+
+if ! [ "$KEEP_FILES" = "1" ]; then
+    log "keep_files not set, removing stdin, stdout and stderr"
+    rm -f "$STDIN" "$STDOUT" "$STDERR"
+else
+    log "keep_files is set, keep stdin, stdout and stderr"
+fi
+
+log "passing through exit status: $NRI_EXIT_STATUS"
+exit "$NRI_EXIT_STATUS"
